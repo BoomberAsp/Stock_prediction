@@ -1,0 +1,5 @@
+--2025-12-02 08:59:21--  http://172.18.30.155/c/dl-pubfile/csi300.zip?td=t6mwvi
+Connecting to 172.18.30.155:80... connected.
+HTTP request sent, awaiting response... 400 Bad Request
+2025-12-02 08:59:21 ERROR 400: Bad Request.
+
