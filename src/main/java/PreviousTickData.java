@@ -3,16 +3,25 @@ import java.io.Serializable;
 /**
  * 前一时刻的数据缓存结构
  */
-public class PreviousTickData implements Serializable {
-    private long tradeTime;      // 交易时间
-    private long ap1;            // 卖一价
-    private long bp1;            // 买一价
-    private long[] bv;           // 前5档买单量
-    private long[] av;           // 前5档卖单量
+public class PreviousTickData {
+    private long tradeTime;
+    private long ap1;
+    private long bp1;
+    long[] bv = new long[5];  // 前5档买单量（索引0-4）
+    long[] av = new long[5];  // 前5档卖单量（索引0-4）
 
-    public PreviousTickData() {
-        this.bv = new long[5];
-        this.av = new long[5];
+    public PreviousTickData() {}
+
+    public PreviousTickData(long tradeTime, long ap1, long bp1, long[] bv, long[] av) {
+        this.tradeTime = tradeTime;
+        this.ap1 = ap1;
+        this.bp1 = bp1;
+        if (bv != null && bv.length >= 5) {
+            System.arraycopy(bv, 0, this.bv, 0, 5);
+        }
+        if (av != null && av.length >= 5) {
+            System.arraycopy(av, 0, this.av, 0, 5);
+        }
     }
 
     // Getters and Setters
@@ -25,15 +34,25 @@ public class PreviousTickData implements Serializable {
     public long getBp1() { return bp1; }
     public void setBp1(long bp1) { this.bp1 = bp1; }
 
-    public long getBv(int index) { return bv[index]; }
-    public void setBv(int index, long value) { bv[index] = value; }
+    public long getBv(int index) {
+        if (index >= 0 && index < 5) return bv[index];
+        return 0;
+    }
 
-    public long getAv(int index) { return av[index]; }
-    public void setAv(int index, long value) { av[index] = value; }
+    public void setBv(int index, long value) {
+        if (index >= 0 && index < 5) bv[index] = value;
+    }
 
-    /**
-     * 深拷贝方法
-     */
+    public long getAv(int index) {
+        if (index >= 0 && index < 5) return av[index];
+        return 0;
+    }
+
+    public void setAv(int index, long value) {
+        if (index >= 0 && index < 5) av[index] = value;
+    }
+
+
     public PreviousTickData deepCopy() {
         PreviousTickData copy = new PreviousTickData();
         copy.tradeTime = this.tradeTime;
