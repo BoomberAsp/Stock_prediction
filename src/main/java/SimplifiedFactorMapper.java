@@ -1,4 +1,3 @@
-// [file name]: SixDigitTimeFactorMapper.java
 import org.apache.hadoop.io.*;
 import org.apache.hadoop.mapreduce.Mapper;
 import java.io.IOException;
@@ -6,22 +5,29 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 专门处理6位时间格式的因子计算Mapper
+ * 极速版 Mapper：移除了 split，使用手动解析 CSV
  */
 public class SimplifiedFactorMapper extends Mapper<LongWritable, Text, Text, Text> {
 
     // 缓存：股票代码 -> 前一tick数据
     private Map<String, PreviousTickData> prevDataCache;
 
+    // 复用 Hadoop 的 Text 对象，减少 GC
+    private Text outKey = new Text();
+    private Text outValue = new Text();
+
     // 统计
     private long processedCount = 0;
     private long validCount = 0;
     private long filteredByTimeCount = 0;
 
+    // 预分配数组用于存储逗号位置，避免每行都 new
+    private int[] commaIndices = new int[100];
+
     @Override
     protected void setup(Context context) {
         prevDataCache = new HashMap<>(500); // 沪深300股票
-        System.out.println("SixDigitTimeFactorMapper initialized");
+        System.out.println("SimplifiedFactorMapper (Fast-Parse Version) initialized");
     }
 
     @Override
@@ -29,128 +35,166 @@ public class SimplifiedFactorMapper extends Mapper<LongWritable, Text, Text, Tex
             throws IOException, InterruptedException {
 
         processedCount++;
+        String line = value.toString(); // 这里不 trim，为了保持索引准确，且 split 也是不 trim 的
 
-        // 进度报告
-        if (processedCount % 50000 == 0) {
-            System.out.printf("Processed: %,d, Valid: %,d, Filtered by time: %,d\n",
-                    processedCount, validCount, filteredByTimeCount);
+        // === 1. 快速解析：扫描逗号位置 ===
+        int commaCount = 0;
+        int len = line.length();
+
+        // 记录每一个逗号的索引
+        for (int i = 0; i < len; i++) {
+            if (line.charAt(i) == ',') {
+                commaIndices[commaCount++] = i;
+                // 我们只需要解析到前 40 列左右即可，不需要扫描整行
+                if (commaCount >= 50) break;
+            }
         }
 
-        String line = value.toString().trim();
+        // 验证字段数量 (至少要有37个字段，即36个逗号)
+        if (commaCount < 36) {
+            return; // 格式错误或空行
+        }
+
+        // === 2. 提取关键字段 (Date, Time, Code) ===
+        // 第0列: Date (0 到 第1个逗号)
+        String tradingDay = line.substring(0, commaIndices[0]);
+
+        // 第1列: Time (第1个逗号+1 到 第2个逗号)
+        String timeStr = line.substring(commaIndices[0] + 1, commaIndices[1]);
 
         // 跳过表头
-        if (line.startsWith("tradingDay") || line.startsWith("tradeTime") || line.isEmpty()) {
-            return;
-        }
+        if (Character.isLetter(tradingDay.charAt(0))) return;
 
-        String[] fields = line.split(",");
-
-        // 验证字段数量
-        if (fields.length < 37) {
-            if (processedCount <= 10) {
-                System.out.println("Warning: Skipping line with " + fields.length + " fields");
-            }
-            return;
-        }
-
-        // 解析字段
-        String tradingDay = fields[0];
-        long tradeTime;
-        String stockCode;
-
-        try {
-            tradeTime = Long.parseLong(fields[1]);
-            stockCode = fields[4];
-        } catch (NumberFormatException e) {
-            return;
-        }
-
-        // 过滤非交易时间（9:30:00 - 15:00:00）
-        if (!FixedTimeParser.isTradingTime(tradeTime)) {
+        // === 3. 极速时间过滤 (使用字符串比较，不转 Long) ===
+        // 过滤非交易时间（9:30:00 - 14:57:00）
+        // 注意：这里根据你的逻辑，如果是 15:00:00 也要包含的话，可以调整
+        if (timeStr.compareTo("093000") < 0 || timeStr.compareTo("145700") > 0) {
             filteredByTimeCount++;
             return;
         }
 
-        // 提取数据
-        TickData current = extractTickData(fields);
+        // 第4列: StockCode (第4个逗号+1 到 第5个逗号)
+        String stockCode = line.substring(commaIndices[3] + 1, commaIndices[4]);
 
-        // 构建缓存键：股票代码 + 交易日
+        long tradeTime;
+        try {
+            tradeTime = Long.parseLong(timeStr);
+        } catch (NumberFormatException e) {
+            return;
+        }
+
+        // === 4. 提取数据 (使用优化的提取方法) ===
+        TickData current = extractTickDataFast(line, commaIndices, tradeTime);
+        if (current == null) return; // 解析失败
+
+        // === 5. 缓存与计算 (逻辑保持不变) ===
         String cacheKey = stockCode + "_" + tradingDay;
-
-        // 获取历史数据
         PreviousTickData prevData = prevDataCache.get(cacheKey);
 
-        // 计算因子（包含需要历史数据的因子）
+        // 计算因子
         double[] factors = calculateFactorsWithHistory(current, prevData);
 
-        // 输出：tradeTime -> stockCode|factor1,...,factor20
-        String outputKey = String.valueOf(tradeTime);
+        // === 6. 构造输出 ===
+        // Key: 日期_时间 (让 Hadoop 自动排序)
+        outKey.set(tradingDay + "_" + timeStr);
+
+        // Value: 1|因子1,因子2...
         StringBuilder factorStr = new StringBuilder();
-        factorStr.append(stockCode).append("|");
+        factorStr.append("1|");
 
         for (int i = 1; i <= 20; i++) {
             factorStr.append(String.format("%.6f", factors[i]));
             if (i < 20) factorStr.append(",");
         }
 
-        context.write(new Text(outputKey), new Text(factorStr.toString()));
+        outValue.set(factorStr.toString());
+        context.write(outKey, outValue);
         validCount++;
 
-        // 更新缓存：保存当前数据作为下一时刻的历史数据
+        // 更新缓存
         updateCache(cacheKey, current, tradeTime);
     }
 
     /**
-     * 提取tick数据
+     * 极速提取 TickData (直接从 line 截取，不使用 split 数组)
      */
-    private TickData extractTickData(String[] fields) {
+    private TickData extractTickDataFast(String line, int[] cIdx, long tradeTimeVal) {
         TickData data = new TickData();
+        data.tradeTime = tradeTimeVal;
 
         try {
-            // 基础字段
-            data.tradeTime = Long.parseLong(fields[1]);
-            data.last = Long.parseLong(fields[8]);
-            data.tBidVol = Long.parseLong(fields[12]);
-            data.tAskVol = Long.parseLong(fields[13]);
+            // Helper function to get substring between commas
+            // Col N is between cIdx[N-1] and cIdx[N]
 
-            // 买卖一档
-            data.bp1 = Long.parseLong(fields[17]);
-            data.bv1 = Long.parseLong(fields[18]);
-            data.ap1 = Long.parseLong(fields[19]);
-            data.av1 = Long.parseLong(fields[20]);
+            // last: Col 8
+            data.last = parseLongFast(line, cIdx[7] + 1, cIdx[8]);
+
+            // tBidVol: Col 12
+            data.tBidVol = parseLongFast(line, cIdx[11] + 1, cIdx[12]);
+            // tAskVol: Col 13
+            data.tAskVol = parseLongFast(line, cIdx[12] + 1, cIdx[13]);
+
+            // 买卖一档 (Col 17-20)
+            data.bp1 = parseLongFast(line, cIdx[16] + 1, cIdx[17]);
+            data.bv1 = parseLongFast(line, cIdx[17] + 1, cIdx[18]);
+            data.ap1 = parseLongFast(line, cIdx[18] + 1, cIdx[19]);
+            data.av1 = parseLongFast(line, cIdx[19] + 1, cIdx[20]);
 
             // 前5档买卖价量
             for (int i = 1; i <= 5; i++) {
-                int baseIdx = 17 + (i-1) * 4;
-                if (baseIdx + 3 < fields.length) {
-                    data.bp[i] = parseLongSafe(fields[baseIdx]);
-                    data.bv[i] = parseLongSafe(fields[baseIdx + 1]);
-                    data.ap[i] = parseLongSafe(fields[baseIdx + 2]);
-                    data.av[i] = parseLongSafe(fields[baseIdx + 3]);
-                }
-            }
+                // Base Index for Level i (Level 1 starts at 17)
+                // Col Index logic: 17 + (i-1)*4
+                // Array logic: cIdx[base-1] to cIdx[base]
 
-        } catch (NumberFormatException e) {
-            // 记录错误但不中断处理
-            if (processedCount <= 100) {
-                System.err.println("Parse error at record " + processedCount + ": " + e.getMessage());
+                int baseCol = 17 + (i - 1) * 4;
+
+                // 确保没有越界 (虽然之前检查过 commaCount)
+                // bp[i]
+                data.bp[i] = parseLongFast(line, cIdx[baseCol-1] + 1, cIdx[baseCol]);
+                // bv[i]
+                data.bv[i] = parseLongFast(line, cIdx[baseCol] + 1, cIdx[baseCol+1]);
+                // ap[i]
+                data.ap[i] = parseLongFast(line, cIdx[baseCol+1] + 1, cIdx[baseCol+2]);
+                // av[i]
+                data.av[i] = parseLongFast(line, cIdx[baseCol+2] + 1, cIdx[baseCol+3]);
             }
+        } catch (Exception e) {
+            return null; // 遇到解析错误直接丢弃该行
         }
-
         return data;
     }
 
-    private long parseLongSafe(String str) {
+    /**
+     * 快速解析 Long，替代 Long.parseLong
+     * 处理空串和包含小数点的整数 (如 "100.0")
+     */
+    private long parseLongFast(String line, int start, int end) {
+        if (start >= end) return 0L;
+
+        // 检查是否为空字符串
+        boolean isEmpty = true;
+        for(int i=start; i<end; i++) {
+            if(line.charAt(i) != ' ') {
+                isEmpty = false;
+                break;
+            }
+        }
+        if(isEmpty) return 0L;
+
         try {
-            return Long.parseLong(str);
+            String sub = line.substring(start, end).trim();
+            if (sub.isEmpty()) return 0L;
+            if (sub.contains(".")) {
+                return (long) Double.parseDouble(sub);
+            }
+            return Long.parseLong(sub);
         } catch (NumberFormatException e) {
             return 0L;
         }
     }
 
-    /**
-     * 计算所有因子（包含需要历史数据的因子）
-     */
+    // === 下面所有的计算逻辑保持完全不变 ===
+
     private double[] calculateFactorsWithHistory(TickData current, PreviousTickData prev) {
         double[] factors = new double[21];
 
@@ -365,11 +409,6 @@ public class SimplifiedFactorMapper extends Mapper<LongWritable, Text, Text, Tex
 
     @Override
     protected void cleanup(Context context) throws IOException, InterruptedException {
-        System.out.println("\n=== Mapper Summary ===");
-        System.out.println("Total processed: " + processedCount);
-        System.out.println("Valid records: " + validCount);
-        System.out.println("Filtered by time: " + filteredByTimeCount);
-        System.out.println("Cache size: " + prevDataCache.size());
-        System.out.println("===================\n");
+        // 关闭不必要的日志，减少IO
     }
 }
