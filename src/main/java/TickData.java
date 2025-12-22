@@ -18,6 +18,18 @@ public class TickData {
 
     // 最新成交价（用于因子计算）
     public long last;
+    // [关键] 重置方法：为了对象复用，避免 new
+    public void reset() {
+        tradeTime = 0;
+        last = 0;
+        tBidVol = 0;
+        tAskVol = 0;
+        bp1 = 0;
+        bv1 = 0;
+        ap1 = 0;
+        av1 = 0;
+    }
+        // 数组不需要清零，后续会直接覆盖，为了极致速度
 
     // 时间
     public long tradeTime;
